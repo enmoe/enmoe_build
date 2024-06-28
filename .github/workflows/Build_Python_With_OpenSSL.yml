@@ -1,0 +1,73 @@
+name: Build Python with OpenSSL on MacOS 
+
+on: 
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        run: |
+          # Download and extract Python
+          wget https://www.python.org/ftp/python/3.12.4/Python-3.12.4.tgz
+          tar -xvf Python-3.12.4.tgz
+
+      - name: Set up OpenSSL
+        run: |
+          # Download and extract OpenSSL
+          wget https://www.openssl.org/source/openssl-3.0.14.tar.gz
+          tar -xvf openssl-3.0.14.tar.gz
+
+      - name: Install OpenSSL
+        run: |
+          cd openssl-3.0.14
+          ./Configure --prefix=/usr/local/openssl-3.0.14
+          make -j $(sysctl -n hw.ncpu)
+          sudo make install
+
+      - name: Create OpenSSL macOS Installer Package
+        run: |
+          pkgbuild --root /usr/local/openssl-3.0.14 --identifier org.enmoe.openssl --version 3.0.14 --install-location /usr/local/openssl-3.0.14 openssl-3.0.14.pkg
+
+      - name: Build and Install Python
+        run: |
+          cd Python-3.12.4
+          ./configure --prefix=/usr/local/Python-3.12.4 --enable-optimizations --with-openssl=/usr/local/openssl-3.0.14
+          make -j $(sysctl -n hw.ncpu)
+          sudo make install
+
+      - name: Create Python macOS Installer Package
+        run: |
+          pkgbuild --root /usr/local/Python-3.12.4 --identifier org.enmoe.python --version 3.12.4 --install-location /usr/local/Python-3.12.4 python-3.12.4.pkg
+
+      - name: Clean Up
+        run: |
+          sudo rm -rf openssl-3.0.14
+          sudo rm -rf Python-3.12.4
+
+      - name: Verify Python and OpenSSL Installation
+        run: |
+          /usr/local/Python-3.12.4/bin/python3 --version
+          /usr/local/Python-3.12.4/bin/python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+
+      - name: Upload OpenSSL macOS Installer Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: openssl-3.0.14.pkg
+          path: openssl-3.0.14.pkg
+
+      - name: Upload Python macOS Installer Package
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-3.12.4.pkg
+          path: python-3.12.4.pkg
