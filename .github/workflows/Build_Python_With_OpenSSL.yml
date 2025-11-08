@@ -19,7 +19,7 @@ jobs:
       - name: Set up Python
         run: |
           # Download and extract Python
-          wget https://www.python.org/ftp/python/3.13.4/Python-3.14.0.tgz
+          wget https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tgz
           tar -xvf Python-3.14.0.tgz
 
       - name: Set up OpenSSL
@@ -48,7 +48,7 @@ jobs:
 
       - name: Create Python macOS Installer Package
         run: |
-          pkgbuild --root /usr/local/Python-3.14.0 --identifier org.enmoe.python --version 3.13.4 --install-location /usr/local/Python-3.14.0 Python-3.14.0.pkg
+          pkgbuild --root /usr/local/Python-3.14.0 --identifier org.enmoe.python --version 3.14.0 --install-location /usr/local/Python-3.14.0 Python-3.14.0.pkg
 
       - name: Clean Up
         run: |
