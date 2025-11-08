@@ -19,8 +19,8 @@ jobs:
       - name: Set up Python
         run: |
           # Download and extract Python
-          wget https://www.python.org/ftp/python/3.13.4/Python-3.13.4.tgz
-          tar -xvf Python-3.13.4.tgz
+          wget https://www.python.org/ftp/python/3.13.4/Python-3.14.0.tgz
+          tar -xvf Python-3.14.0.tgz
 
       - name: Set up OpenSSL
         run: |
@@ -41,24 +41,24 @@ jobs:
 
       - name: Build and Install Python
         run: |
-          cd Python-3.13.4
-          ./configure --prefix=/usr/local/Python-3.13.4 --enable-optimizations --with-openssl=/usr/local/openssl-3.5.4
+          cd Python-3.14.0
+          ./configure --prefix=/usr/local/Python-3.14.0 --enable-optimizations --with-openssl=/usr/local/openssl-3.5.4
           make -j $(sysctl -n hw.ncpu)
           sudo make install
 
       - name: Create Python macOS Installer Package
         run: |
-          pkgbuild --root /usr/local/Python-3.13.4 --identifier org.enmoe.python --version 3.13.4 --install-location /usr/local/Python-3.13.4 python-3.13.4.pkg
+          pkgbuild --root /usr/local/Python-3.14.0 --identifier org.enmoe.python --version 3.13.4 --install-location /usr/local/Python-3.14.0 Python-3.14.0.pkg
 
       - name: Clean Up
         run: |
           sudo rm -rf openssl-3.5.4
-          sudo rm -rf Python-3.13.4
+          sudo rm -rf Python-3.14.0
 
       - name: Verify Python and OpenSSL Installation
         run: |
-          /usr/local/Python-3.13.4/bin/python3 --version
-          /usr/local/Python-3.13.4/bin/python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
+          /usr/local/Python-3.14.0/bin/python3 --version
+          /usr/local/Python-3.14.0/bin/python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
 
       - name: Upload OpenSSL macOS Installer Package
         uses: actions/upload-artifact@v4
@@ -69,5 +69,5 @@ jobs:
       - name: Upload Python macOS Installer Package
         uses: actions/upload-artifact@v4
         with:
-          name: python-3.13.4.pkg
-          path: python-3.13.4.pkg
+          name: Python-3.14.0.pkg
+          path: Python-3.14.0.pkg
