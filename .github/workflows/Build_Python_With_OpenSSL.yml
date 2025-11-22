@@ -6,23 +6,12 @@ on:
   pull_request:
     branches: [ main ]
 
+# === 顶层配置区域 (仅定义静态变量) ===
 env:
-  # === 🚨 用户自定义配置区域 (User Configuration) 🚨 ===
-  
-  # Python 版本号
   PYTHON_VERSION: "3.14.0" 
-  # Python 源码包下载链接 (请替换成实际的 URL)
-  PYTHON_URL: "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/Python-${{ env.PYTHON_VERSION }}.tgz"
-  
-  # OpenSSL 版本号
   OPENSSL_VERSION: "3.5.4"
-  # OpenSSL 源码包下载链接 (请替换成实际的 URL)
-  OPENSSL_URL: "https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
-  
-  # 安装根目录 (保持 /usr/local 不变)
   INSTALL_ROOT: "/usr/local"
-  
-  # === /用户自定义配置区域 ===
+# =======================================
 
 jobs:
   build:
@@ -34,6 +23,9 @@ jobs:
 
       # 1. 准备 OpenSSL 环境
       - name: Download and Extract OpenSSL
+        # 动态计算 OpenSSL URL
+        env:
+          OPENSSL_URL: "https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
         run: |
           echo "Downloading OpenSSL from: ${{ env.OPENSSL_URL }}"
           curl -L -o openssl.tar.gz ${{ env.OPENSSL_URL }}
@@ -60,6 +52,7 @@ jobs:
           mkdir -p scripts_openssl
           cat <<EOF > scripts_openssl/postinstall
           #!/bin/bash
+          # 将 OpenSSL 路径添加到 macOS 系统路径中，供所有用户使用
           if [ ! -d "/etc/paths.d" ]; then
             mkdir -p /etc/paths.d
           fi
@@ -78,6 +71,9 @@ jobs:
 
       # 3. 准备 Python 环境
       - name: Download and Extract Python
+        # 动态计算 Python URL
+        env:
+          PYTHON_URL: "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/Python-${{ env.PYTHON_VERSION }}.tgz"
         run: |
           echo "Downloading Python from: ${{ env.PYTHON_URL }}"
           curl -L -o python.tgz ${{ env.PYTHON_URL }}
@@ -115,6 +111,7 @@ jobs:
           mkdir -p scripts_python
           cat <<EOF > scripts_python/postinstall
           #!/bin/bash
+          # 将 Python 路径添加到 macOS 系统路径中，供所有用户使用
           if [ ! -d "/etc/paths.d" ]; then
             mkdir -p /etc/paths.d
           fi
@@ -134,11 +131,14 @@ jobs:
       - name: Verify Installation
         run: |
           PYTHON_BIN="${{ env.INSTALL_ROOT }}/Python-${{ env.PYTHON_VERSION }}/bin/python3"
+          echo "--- Verifying Python Version ---"
           $PYTHON_BIN --version
-          $PYTHON_BIN -c "import ssl; print(f'Python SSL Version: {ssl.OPENSSL_VERSION}')"
+          echo "--- Verifying OpenSSL Link ---"
+          $PYTHON_BIN -c "import ssl; print(f'Python linked to OpenSSL Version: {ssl.OPENSSL_VERSION}')"
 
       - name: Clean Up
         run: |
+          echo "Cleaning up source and temporary installation directories..."
           sudo rm -rf openssl_src
           sudo rm -rf python_src
           sudo rm -rf ${{ env.INSTALL_ROOT }}/openssl-${{ env.OPENSSL_VERSION }}
