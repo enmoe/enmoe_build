@@ -1,12 +1,28 @@
-name: Build Python with OpenSSL on MacOS 
+name: Build Python with OpenSSL on MacOS
 
-on: 
+on:
   push:
-    branches:
-      - main
+    branches: [ main ]
   pull_request:
-    branches:
-      - main
+    branches: [ main ]
+
+env:
+  # === 🚨 用户自定义配置区域 (User Configuration) 🚨 ===
+  
+  # Python 版本号
+  PYTHON_VERSION: "3.14.0" 
+  # Python 源码包下载链接 (请替换成实际的 URL)
+  PYTHON_URL: "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/Python-${{ env.PYTHON_VERSION }}.tgz"
+  
+  # OpenSSL 版本号
+  OPENSSL_VERSION: "3.5.4"
+  # OpenSSL 源码包下载链接 (请替换成实际的 URL)
+  OPENSSL_URL: "https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
+  
+  # 安装根目录 (保持 /usr/local 不变)
+  INSTALL_ROOT: "/usr/local"
+  
+  # === /用户自定义配置区域 ===
 
 jobs:
   build:
@@ -16,58 +32,126 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      # 1. 准备 OpenSSL 环境
+      - name: Download and Extract OpenSSL
         run: |
-          # Download and extract Python
-          wget https://www.python.org/ftp/python/3.14.0/Python-3.14.0.tgz
-          tar -xvf Python-3.14.0.tgz
+          echo "Downloading OpenSSL from: ${{ env.OPENSSL_URL }}"
+          curl -L -o openssl.tar.gz ${{ env.OPENSSL_URL }}
+          tar -xvf openssl.tar.gz
+          mv openssl-${{ env.OPENSSL_VERSION }} openssl_src
 
-      - name: Set up OpenSSL
+      - name: Build and Install OpenSSL
         run: |
-          # Download and extract OpenSSL
-          wget https://www.openssl.org/source/openssl-3.5.4.tar.gz
-          tar -xvf openssl-3.5.4.tar.gz
-
-      - name: Install OpenSSL
-        run: |
-          cd openssl-3.5.4
-          ./Configure --prefix=/usr/local/openssl-3.5.4
+          cd openssl_src
+          TARGET_DIR="${{ env.INSTALL_ROOT }}/openssl-${{ env.OPENSSL_VERSION }}"
+          
+          ./Configure --prefix=$TARGET_DIR --openssldir=$TARGET_DIR/ssl
           make -j $(sysctl -n hw.ncpu)
           sudo make install
 
-      - name: Create OpenSSL macOS Installer Package
+      # 2. 创建 OpenSSL 安装包 (带环境变量注入脚本)
+      - name: Create OpenSSL Installer with PATH injection
         run: |
-          pkgbuild --root /usr/local/openssl-3.5.4 --identifier org.enmoe.openssl --version 3.3.2 --install-location /usr/local/openssl-3.5.4 openssl-3.5.4.pkg
+          TARGET_DIR="${{ env.INSTALL_ROOT }}/openssl-${{ env.OPENSSL_VERSION }}"
+          PKG_ID="org.enmoe.openssl"
+          PKG_NAME="openssl-${{ env.OPENSSL_VERSION }}.pkg"
+          
+          # 动态生成 postinstall 脚本，用于写入 /etc/paths.d/
+          mkdir -p scripts_openssl
+          cat <<EOF > scripts_openssl/postinstall
+          #!/bin/bash
+          if [ ! -d "/etc/paths.d" ]; then
+            mkdir -p /etc/paths.d
+          fi
+          echo "$TARGET_DIR/bin" > /etc/paths.d/${PKG_ID}
+          chmod 644 /etc/paths.d/${PKG_ID}
+          exit 0
+          EOF
+          chmod +x scripts_openssl/postinstall
+          
+          pkgbuild --root $TARGET_DIR \
+                   --identifier $PKG_ID \
+                   --version ${{ env.OPENSSL_VERSION }} \
+                   --install-location $TARGET_DIR \
+                   --scripts scripts_openssl \
+                   $PKG_NAME
 
-      - name: Build and Install Python
+      # 3. 准备 Python 环境
+      - name: Download and Extract Python
         run: |
-          cd Python-3.14.0
-          ./configure --prefix=/usr/local/Python-3.14.0 --enable-optimizations --with-openssl=/usr/local/openssl-3.5.4
+          echo "Downloading Python from: ${{ env.PYTHON_URL }}"
+          curl -L -o python.tgz ${{ env.PYTHON_URL }}
+          tar -xvf python.tgz
+          mv Python-${{ env.PYTHON_VERSION }} python_src
+
+      - name: Build and Install Python (Linked to Custom OpenSSL)
+        run: |
+          cd python_src
+          
+          OPENSSL_DIR="${{ env.INSTALL_ROOT }}/openssl-${{ env.OPENSSL_VERSION }}"
+          TARGET_DIR="${{ env.INSTALL_ROOT }}/Python-${{ env.PYTHON_VERSION }}"
+          
+          # 确保 Python 能找到并链接到我们编译的 OpenSSL
+          export LDFLAGS="-L${OPENSSL_DIR}/lib"
+          export CPPFLAGS="-I${OPENSSL_DIR}/include"
+          
+          ./configure \
+            --prefix=$TARGET_DIR \
+            --enable-optimizations \
+            --with-openssl=$OPENSSL_DIR \
+            --with-openssl-rpath=auto
+            
           make -j $(sysctl -n hw.ncpu)
           sudo make install
 
-      - name: Create Python macOS Installer Package
+      # 4. 创建 Python 安装包 (带环境变量注入脚本)
+      - name: Create Python Installer with PATH injection
         run: |
-          pkgbuild --root /usr/local/Python-3.14.0 --identifier org.enmoe.python --version 3.14.0 --install-location /usr/local/Python-3.14.0 Python-3.14.0.pkg
+          TARGET_DIR="${{ env.INSTALL_ROOT }}/Python-${{ env.PYTHON_VERSION }}"
+          PKG_ID="org.enmoe.python"
+          PKG_NAME="Python-${{ env.PYTHON_VERSION }}.pkg"
+          
+          # 动态生成 postinstall 脚本，用于写入 /etc/paths.d/
+          mkdir -p scripts_python
+          cat <<EOF > scripts_python/postinstall
+          #!/bin/bash
+          if [ ! -d "/etc/paths.d" ]; then
+            mkdir -p /etc/paths.d
+          fi
+          echo "$TARGET_DIR/bin" > /etc/paths.d/${PKG_ID}
+          chmod 644 /etc/paths.d/${PKG_ID}
+          exit 0
+          EOF
+          chmod +x scripts_python/postinstall
+          
+          pkgbuild --root $TARGET_DIR \
+                   --identifier $PKG_ID \
+                   --version ${{ env.PYTHON_VERSION }} \
+                   --install-location $TARGET_DIR \
+                   --scripts scripts_python \
+                   $PKG_NAME
+
+      - name: Verify Installation
+        run: |
+          PYTHON_BIN="${{ env.INSTALL_ROOT }}/Python-${{ env.PYTHON_VERSION }}/bin/python3"
+          $PYTHON_BIN --version
+          $PYTHON_BIN -c "import ssl; print(f'Python SSL Version: {ssl.OPENSSL_VERSION}')"
 
       - name: Clean Up
         run: |
-          sudo rm -rf openssl-3.5.4
-          sudo rm -rf Python-3.14.0
+          sudo rm -rf openssl_src
+          sudo rm -rf python_src
+          sudo rm -rf ${{ env.INSTALL_ROOT }}/openssl-${{ env.OPENSSL_VERSION }}
+          sudo rm -rf ${{ env.INSTALL_ROOT }}/Python-${{ env.PYTHON_VERSION }}
 
-      - name: Verify Python and OpenSSL Installation
-        run: |
-          /usr/local/Python-3.14.0/bin/python3 --version
-          /usr/local/Python-3.14.0/bin/python3 -c "import ssl; print(ssl.OPENSSL_VERSION)"
-
-      - name: Upload OpenSSL macOS Installer Package
+      - name: Upload OpenSSL macOS Installer
         uses: actions/upload-artifact@v4
         with:
-          name: openssl-3.5.4.pkg
-          path: openssl-3.5.4.pkg
+          name: openssl-${{ env.OPENSSL_VERSION }}.pkg
+          path: openssl-${{ env.OPENSSL_VERSION }}.pkg
 
-      - name: Upload Python macOS Installer Package
+      - name: Upload Python macOS Installer
         uses: actions/upload-artifact@v4
         with:
-          name: Python-3.14.0.pkg
-          path: Python-3.14.0.pkg
+          name: Python-${{ env.PYTHON_VERSION }}.pkg
+          path: Python-${{ env.PYTHON_VERSION }}.pkg
