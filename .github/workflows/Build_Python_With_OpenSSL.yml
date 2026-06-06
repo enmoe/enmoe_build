@@ -1,0 +1,136 @@
+name: Build Python with OpenSSL on macOS
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+# === 顶层配置区域 (完全隔离的专属路径) ===
+env:
+  PYTHON_VERSION: "3.14.5"   
+  OPENSSL_VERSION: "3.5.6"  
+  # 专属安装根目录
+  OPENSSL_TARGET: "/usr/local/openssl-${{ env.OPENSSL_VERSION }}"
+  PYTHON_TARGET: "/usr/local/Python-${{ env.PYTHON_VERSION }}"
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 1. 编译并打包专属路径的 OpenSSL
+      # ==========================================
+      - name: Download and Extract OpenSSL
+        env:
+          OPENSSL_URL: "https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
+        run: |
+          curl -L -o openssl.tar.gz ${{ env.OPENSSL_URL }}
+          tar -xzf openssl.tar.gz
+          mv openssl-${{ env.OPENSSL_VERSION }} openssl_src
+
+      - name: Build and Install OpenSSL
+        run: |
+          cd openssl_src
+          # 显式启用 shared (动态库)，安装到专属独立路径
+          ./Configure shared --prefix=${{ env.OPENSSL_TARGET }} --openssldir=${{ env.OPENSSL_TARGET }}/ssl
+          make -j $(sysctl -n hw.ncpu)
+          sudo make install
+
+      - name: Create OpenSSL .pkg (从专属路径抓取)
+        run: |
+          PKG_ID="org.enmoe.openssl.${{ env.OPENSSL_VERSION }}"
+          PKG_NAME="openssl-${{ env.OPENSSL_VERSION }}.pkg"
+          
+          mkdir -p scripts_openssl
+          cat <<EOF > scripts_openssl/postinstall
+          #!/bin/bash
+          # 使用 macOS 官方推荐的 /etc/paths.d 机制注入环境变量
+          if [ ! -d "/etc/paths.d" ]; then mkdir -p /etc/paths.d; fi
+          echo "${{ env.OPENSSL_TARGET }}/bin" > /etc/paths.d/${PKG_ID}
+          chmod 644 /etc/paths.d/${PKG_ID}
+          exit 0
+          EOF
+          chmod +x scripts_openssl/postinstall
+          
+          # 【核心改动】--root 直接指向刚刚安装好的专属目录
+          # --install-location 让它在用户电脑上也解压到一模一样的专属目录
+          sudo pkgbuild --root ${{ env.OPENSSL_TARGET }} \
+                   --identifier $PKG_ID \
+                   --version ${{ env.OPENSSL_VERSION }} \
+                   --install-location ${{ env.OPENSSL_TARGET }} \
+                   --scripts scripts_openssl \
+                   $PKG_NAME
+
+      # ==========================================
+      # 2. 编译并打包专属路径的 Python (硬编码链接到上面的 OpenSSL)
+      # ==========================================
+      - name: Download and Extract Python
+        env:
+          PYTHON_URL: "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/Python-${{ env.PYTHON_VERSION }}.tgz"
+        run: |
+          curl -L -o python.tgz ${{ env.PYTHON_URL }}
+          tar -xzf python.tgz
+          mv Python-${{ env.PYTHON_VERSION }} python_src
+
+      - name: Build and Install Python
+        run: |
+          cd python_src
+          
+          # 让 Python 编译器死死记住这个绝对的 OpenSSL 专属路径
+          export LDFLAGS="-L${{ env.OPENSSL_TARGET }}/lib"
+          export CPPFLAGS="-I${{ env.OPENSSL_TARGET }}/include"
+          
+          ./configure \
+            --prefix=${{ env.PYTHON_TARGET }} \
+            --enable-optimizations \
+            --with-openssl=${{ env.OPENSSL_TARGET }} \
+            --with-openssl-rpath=auto
+            
+          make -j $(sysctl -n hw.ncpu)
+          sudo make install
+
+      - name: Create Python .pkg (从专属路径抓取)
+        run: |
+          # 加上版本号作为 ID 的一部分，防止覆盖旧版本的路径配置
+          PKG_ID="org.enmoe.python.${{ env.PYTHON_VERSION }}"
+          PKG_NAME="Python-${{ env.PYTHON_VERSION }}.pkg"
+          
+          mkdir -p scripts_python
+          cat <<EOF > scripts_python/postinstall
+          #!/bin/bash
+          if [ ! -d "/etc/paths.d" ]; then mkdir -p /etc/paths.d; fi
+          echo "${{ env.PYTHON_TARGET }}/bin" > /etc/paths.d/${PKG_ID}
+          chmod 644 /etc/paths.d/${PKG_ID}
+          exit 0
+          EOF
+          chmod +x scripts_python/postinstall
+          
+          sudo pkgbuild --root ${{ env.PYTHON_TARGET }} \
+                   --identifier $PKG_ID \
+                   --version ${{ env.PYTHON_VERSION }} \
+                   --install-location ${{ env.PYTHON_TARGET }} \
+                   --scripts scripts_python \
+                   $PKG_NAME
+
+      # ==========================================
+      # 3. 验证与产物收集
+      # ==========================================
+      - name: Verify Installation (在当前虚拟机测试)
+        run: |
+          PYTHON_BIN="${{ env.PYTHON_TARGET }}/bin/python3"
+          echo "--- Verifying Python Version ---"
+          $PYTHON_BIN --version
+          echo "--- Verifying OpenSSL Link ---"
+          # 此时能够完美打印，因为 RPATH 路径 /usr/local/openssl-3.5.6 此时在虚拟机里是真实存在的！
+          $PYTHON_BIN -c "import ssl; print(f'Python linked to OpenSSL Version: {ssl.OPENSSL_VERSION}')"
+
+      - name: Upload Installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-Independent-Packages
+          path: |
+            openssl-${{ env.OPENSSL_VERSION }}.pkg
+            Python-${{ env.PYTHON_VERSION }}.pkg
