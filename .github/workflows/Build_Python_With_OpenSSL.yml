@@ -8,8 +8,8 @@ on:
 
 # === 顶层配置区域 (仅定义静态变量) ===
 env:
-  PYTHON_VERSION: "3.14.0" 
-  OPENSSL_VERSION: "3.5.4"
+  PYTHON_VERSION: "3.14.5" 
+  OPENSSL_VERSION: "3.5.6"
   INSTALL_ROOT: "/usr/local"
 # =======================================
 
