@@ -1,136 +1,457 @@
-name: Build Python with OpenSSL on macOS
+
+name: Build Python with OpenSSL for macOS ARM64
+
 on:
   push:
-    branches: [ main ]
+    branches: [main]
   pull_request:
-    branches: [ main ]
+    branches: [main]
+  workflow_dispatch:
 
-# === 顶层配置区域 (完全隔离的专属路径) ===
+# ==========================================
+# Global Configuration
+# ==========================================
 env:
-  PYTHON_VERSION: "3.15.2"   
-  OPENSSL_VERSION: "4.1.0"  
-  # 专属安装根目录
-  OPENSSL_TARGET: "/usr/local/openssl-${{ env.OPENSSL_VERSION }}"
-  PYTHON_TARGET: "/usr/local/Python-${{ env.PYTHON_VERSION }}"
+  PYTHON_VERSION: "3.15.2"
+  OPENSSL_VERSION: "4.1.0"
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build Python and OpenSSL ARM64
     runs-on: macos-latest
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
     steps:
+      # ==========================================
+      # 1. Checkout
+      # ==========================================
       - name: Checkout repository
         uses: actions/checkout@v4
 
       # ==========================================
-      # 1. 编译并打包专属路径的 OpenSSL
+      # 2. Initialize environment
       # ==========================================
-      - name: Download and Extract OpenSSL
-        env:
-          OPENSSL_URL: "https://www.openssl.org/source/openssl-${{ env.OPENSSL_VERSION }}.tar.gz"
+      - name: Initialize environment
         run: |
-          curl -L -o openssl.tar.gz ${{ env.OPENSSL_URL }}
+          set -euo pipefail
+
+          test "$(uname -m)" = "arm64"
+
+          echo "OPENSSL_TARGET=/usr/local/openssl-${OPENSSL_VERSION}" >> "$GITHUB_ENV"
+          echo "PYTHON_TARGET=/usr/local/Python-${PYTHON_VERSION}" >> "$GITHUB_ENV"
+          echo "PYTHON_MINOR=${PYTHON_VERSION%.*}" >> "$GITHUB_ENV"
+
+          echo "Architecture: $(uname -m)"
+          echo "macOS: $(sw_vers -productVersion)"
+          echo "Python: ${PYTHON_VERSION}"
+          echo "OpenSSL: ${OPENSSL_VERSION}"
+
+      # ==========================================
+      # 3. Download OpenSSL
+      # ==========================================
+      - name: Download OpenSSL
+        run: |
+          set -euo pipefail
+
+          URL="https://openssl-library.org/source/openssl-${OPENSSL_VERSION}.tar.gz"
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 30 \
+            -o openssl.tar.gz \
+            "$URL"
+
           tar -xzf openssl.tar.gz
-          mv openssl-${{ env.OPENSSL_VERSION }} openssl_src
 
-      - name: Build and Install OpenSSL
+          mv "openssl-${OPENSSL_VERSION}" openssl_src
+
+      # ==========================================
+      # 4. Build OpenSSL
+      # ==========================================
+      - name: Build and install OpenSSL
         run: |
+          set -euo pipefail
+
           cd openssl_src
-          # 显式启用 shared (动态库)，安装到专属独立路径
-          ./Configure shared --prefix=${{ env.OPENSSL_TARGET }} --openssldir=${{ env.OPENSSL_TARGET }}/ssl
-          make -j $(sysctl -n hw.ncpu)
+
+          ./Configure \
+            darwin64-arm64-cc \
+            shared \
+            --prefix="${OPENSSL_TARGET}" \
+            --openssldir="${OPENSSL_TARGET}/ssl" \
+            --libdir=lib
+
+          make -j "$(sysctl -n hw.ncpu)"
+
           sudo make install
 
-      - name: Create OpenSSL .pkg (从专属路径抓取)
+          "${OPENSSL_TARGET}/bin/openssl" version -a
+
+          test -d "${OPENSSL_TARGET}/lib"
+          test -d "${OPENSSL_TARGET}/include/openssl"
+
+      # ==========================================
+      # 5. Install Mozilla CA certificates
+      # ==========================================
+      - name: Install Mozilla CA certificates
         run: |
-          PKG_ID="org.enmoe.openssl.${{ env.OPENSSL_VERSION }}"
-          PKG_NAME="openssl-${{ env.OPENSSL_VERSION }}.pkg"
-          
+          set -euo pipefail
+
+          CA_DIR="${OPENSSL_TARGET}/ssl"
+          CA_FILE="${CA_DIR}/cert.pem"
+          TEMP_CA="${RUNNER_TEMP}/cacert.pem"
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 30 \
+            --proto '=https' \
+            --tlsv1.2 \
+            -o "$TEMP_CA" \
+            "https://curl.se/ca/cacert.pem"
+
+          test -s "$TEMP_CA"
+
+          grep -q "BEGIN CERTIFICATE" "$TEMP_CA"
+          grep -q "END CERTIFICATE" "$TEMP_CA"
+
+          # Parse and validate the CA bundle
+          "${OPENSSL_TARGET}/bin/openssl" crl2pkcs7 \
+            -nocrl \
+            -certfile "$TEMP_CA" \
+            -outform PEM \
+            -out /dev/null
+
+          sudo mkdir -p "$CA_DIR"
+          sudo install -m 644 "$TEMP_CA" "$CA_FILE"
+
+          test -s "$CA_FILE"
+
+          echo "CA bundle installed:"
+          ls -lh "$CA_FILE"
+
+          "${OPENSSL_TARGET}/bin/openssl" version -d
+
+      # ==========================================
+      # 6. Verify OpenSSL certificate store
+      # ==========================================
+      - name: Verify OpenSSL CA store
+        run: |
+          set -euo pipefail
+
+          OPENSSL_BIN="${OPENSSL_TARGET}/bin/openssl"
+          CA_FILE="${OPENSSL_TARGET}/ssl/cert.pem"
+
+          "$OPENSSL_BIN" version | grep -F "OpenSSL ${OPENSSL_VERSION}"
+
+          test -s "$CA_FILE"
+
+          # Verify real TLS connection with CA validation
+          echo | "$OPENSSL_BIN" s_client \
+            -connect www.python.org:443 \
+            -servername www.python.org \
+            -CAfile "$CA_FILE" \
+            -verify_return_error \
+            2>&1 | tee "${RUNNER_TEMP}/openssl-tls.log"
+
+          grep -q "Verify return code: 0 (ok)" \
+            "${RUNNER_TEMP}/openssl-tls.log"
+
+      # ==========================================
+      # 7. Package OpenSSL
+      # ==========================================
+      - name: Create OpenSSL PKG
+        run: |
+          set -euo pipefail
+
+          PKG_ID="org.enmoe.openssl.${OPENSSL_VERSION}"
+          PKG_NAME="openssl-${OPENSSL_VERSION}-arm64.pkg"
+
           mkdir -p scripts_openssl
-          cat <<EOF > scripts_openssl/postinstall
-          #!/bin/bash
-          # 使用 macOS 官方推荐的 /etc/paths.d 机制注入环境变量
-          if [ ! -d "/etc/paths.d" ]; then mkdir -p /etc/paths.d; fi
-          echo "${{ env.OPENSSL_TARGET }}/bin" > /etc/paths.d/${PKG_ID}
-          chmod 644 /etc/paths.d/${PKG_ID}
+
+          cat > scripts_openssl/postinstall <<EOF
+          #!/bin/sh
+          set -eu
+
+          mkdir -p /etc/paths.d
+
+          echo "${OPENSSL_TARGET}/bin" > \
+            "/etc/paths.d/${PKG_ID}"
+
+          chmod 644 "/etc/paths.d/${PKG_ID}"
+
           exit 0
           EOF
-          chmod +x scripts_openssl/postinstall
-          
-          # 【核心改动】--root 直接指向刚刚安装好的专属目录
-          # --install-location 让它在用户电脑上也解压到一模一样的专属目录
-          sudo pkgbuild --root ${{ env.OPENSSL_TARGET }} \
-                   --identifier $PKG_ID \
-                   --version ${{ env.OPENSSL_VERSION }} \
-                   --install-location ${{ env.OPENSSL_TARGET }} \
-                   --scripts scripts_openssl \
-                   $PKG_NAME
+
+          chmod 755 scripts_openssl/postinstall
+
+          sudo pkgbuild \
+            --root "${OPENSSL_TARGET}" \
+            --identifier "$PKG_ID" \
+            --version "${OPENSSL_VERSION}" \
+            --install-location "${OPENSSL_TARGET}" \
+            --ownership recommended \
+            --scripts scripts_openssl \
+            "$PKG_NAME"
+
+          test -s "$PKG_NAME"
+          ls -lh "$PKG_NAME"
 
       # ==========================================
-      # 2. 编译并打包专属路径的 Python (硬编码链接到上面的 OpenSSL)
+      # 8. Download Python
       # ==========================================
-      - name: Download and Extract Python
-        env:
-          PYTHON_URL: "https://www.python.org/ftp/python/${{ env.PYTHON_VERSION }}/Python-${{ env.PYTHON_VERSION }}.tgz"
+      - name: Download Python
         run: |
-          curl -L -o python.tgz ${{ env.PYTHON_URL }}
+          set -euo pipefail
+
+          URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 30 \
+            -o python.tgz \
+            "$URL"
+
           tar -xzf python.tgz
-          mv Python-${{ env.PYTHON_VERSION }} python_src
 
-      - name: Build and Install Python
+          mv "Python-${PYTHON_VERSION}" python_src
+
+      # ==========================================
+      # 9. Build Python
+      # ==========================================
+      - name: Build and install Python
         run: |
+          set -euo pipefail
+
           cd python_src
-          
-          # 让 Python 编译器死死记住这个绝对的 OpenSSL 专属路径
-          export LDFLAGS="-L${{ env.OPENSSL_TARGET }}/lib"
-          export CPPFLAGS="-I${{ env.OPENSSL_TARGET }}/include"
-          
-          ./configure \
-            --prefix=${{ env.PYTHON_TARGET }} \
-            --enable-optimizations \
-            --with-openssl=${{ env.OPENSSL_TARGET }} \
-            --with-openssl-rpath=auto
-            
-          make -j $(sysctl -n hw.ncpu)
-          sudo make install
 
-      - name: Create Python .pkg (从专属路径抓取)
+          export CPPFLAGS="-I${OPENSSL_TARGET}/include"
+          export LDFLAGS="-L${OPENSSL_TARGET}/lib"
+          export PKG_CONFIG_PATH="${OPENSSL_TARGET}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+          ./configure \
+            --prefix="${PYTHON_TARGET}" \
+            --with-openssl="${OPENSSL_TARGET}" \
+            --with-openssl-rpath="${OPENSSL_TARGET}/lib" \
+            --with-ensurepip=install
+
+          make -j "$(sysctl -n hw.ncpu)"
+
+          sudo make altinstall
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python${PYTHON_MINOR}"
+
+          test -x "$PYTHON_BIN"
+
+          # Provide convenient commands in the private prefix
+          cd "${PYTHON_TARGET}/bin"
+
+          sudo ln -sfn "python${PYTHON_MINOR}" python3
+          sudo ln -sfn "python${PYTHON_MINOR}" python
+
+          if [ -x "pip${PYTHON_MINOR}" ]; then
+            sudo ln -sfn "pip${PYTHON_MINOR}" pip3
+            sudo ln -sfn "pip${PYTHON_MINOR}" pip
+          fi
+
+          "${PYTHON_TARGET}/bin/python3" --version
+
+      # ==========================================
+      # 10. Verify Python and SSL
+      # ==========================================
+      - name: Verify Python and SSL integration
         run: |
-          # 加上版本号作为 ID 的一部分，防止覆盖旧版本的路径配置
-          PKG_ID="org.enmoe.python.${{ env.PYTHON_VERSION }}"
-          PKG_NAME="Python-${{ env.PYTHON_VERSION }}.pkg"
-          
+          set -euo pipefail
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python3"
+
+          "$PYTHON_BIN" - <<'PY'
+          import sys
+          import ssl
+          import _ssl
+          import os
+          import platform
+          import hashlib
+
+          print("Python:", sys.version)
+          print("Python executable:", sys.executable)
+          print("OpenSSL:", ssl.OPENSSL_VERSION)
+          print("Architecture:", platform.machine())
+
+          assert platform.machine() == "arm64"
+          assert platform.python_version() == os.environ["PYTHON_VERSION"]
+          assert ssl.OPENSSL_VERSION.startswith(
+              "OpenSSL " + os.environ["OPENSSL_VERSION"]
+          )
+
+          expected_ca = os.path.join(
+              os.environ["OPENSSL_TARGET"],
+              "ssl",
+              "cert.pem"
+          )
+
+          paths = ssl.get_default_verify_paths()
+
+          print("Default CA file:", paths.cafile)
+          print("Expected CA file:", expected_ca)
+
+          assert paths.cafile == expected_ca
+          assert os.path.isfile(expected_ca)
+
+          context = ssl.create_default_context()
+
+          print("Loaded CA certificates:",
+                len(context.get_ca_certs()))
+
+          assert len(context.get_ca_certs()) > 0
+          assert context.verify_mode == ssl.CERT_REQUIRED
+          assert context.check_hostname
+
+          print("Python SSL verification passed.")
+          PY
+
+          "$PYTHON_BIN" -m pip --version
+
+          SSL_MODULE="$("$PYTHON_BIN" -c 'import _ssl; print(_ssl.__file__)')"
+
+          echo "Dynamic dependencies:"
+          otool -L "$SSL_MODULE"
+
+          # Check _ssl links to our private OpenSSL
+          otool -L "$SSL_MODULE" | grep -F \
+            "${OPENSSL_TARGET}/lib/libssl"
+
+          otool -L "$SSL_MODULE" | grep -F \
+            "${OPENSSL_TARGET}/lib/libcrypto"
+
+      # ==========================================
+      # 11. Verify HTTPS using Python
+      # ==========================================
+      - name: Verify HTTPS certificate validation
+        run: |
+          set -euo pipefail
+
+          "${PYTHON_TARGET}/bin/python3" - <<'PY'
+          import ssl
+          import urllib.request
+
+          context = ssl.create_default_context()
+
+          urls = [
+              "https://www.python.org/",
+              "https://pypi.org/simple/",
+              "https://github.com/",
+          ]
+
+          for url in urls:
+              print("Testing:", url, flush=True)
+
+              with urllib.request.urlopen(
+                  url,
+                  context=context,
+                  timeout=30,
+              ) as response:
+                  print("HTTP:", response.status, flush=True)
+                  assert 200 <= response.status < 400
+
+          print("All HTTPS tests passed.")
+          PY
+
+      # ==========================================
+      # 12. Verify pip HTTPS
+      # ==========================================
+      - name: Verify pip HTTPS
+        run: |
+          set -euo pipefail
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python3"
+
+          "$PYTHON_BIN" -m pip --version
+
+          "$PYTHON_BIN" -m pip index versions certifi \
+            --index-url https://pypi.org/simple/
+
+          echo "pip HTTPS verification passed."
+
+      # ==========================================
+      # 13. Package Python
+      # ==========================================
+      - name: Create Python PKG
+        run: |
+          set -euo pipefail
+
+          PKG_ID="org.enmoe.python.${PYTHON_VERSION}"
+          PKG_NAME="Python-${PYTHON_VERSION}-arm64.pkg"
+
           mkdir -p scripts_python
-          cat <<EOF > scripts_python/postinstall
-          #!/bin/bash
-          if [ ! -d "/etc/paths.d" ]; then mkdir -p /etc/paths.d; fi
-          echo "${{ env.PYTHON_TARGET }}/bin" > /etc/paths.d/${PKG_ID}
-          chmod 644 /etc/paths.d/${PKG_ID}
+
+          cat > scripts_python/postinstall <<EOF
+          #!/bin/sh
+          set -eu
+
+          mkdir -p /etc/paths.d
+
+          echo "${PYTHON_TARGET}/bin" > \
+            "/etc/paths.d/${PKG_ID}"
+
+          chmod 644 "/etc/paths.d/${PKG_ID}"
+
           exit 0
           EOF
-          chmod +x scripts_python/postinstall
-          
-          sudo pkgbuild --root ${{ env.PYTHON_TARGET }} \
-                   --identifier $PKG_ID \
-                   --version ${{ env.PYTHON_VERSION }} \
-                   --install-location ${{ env.PYTHON_TARGET }} \
-                   --scripts scripts_python \
-                   $PKG_NAME
+
+          chmod 755 scripts_python/postinstall
+
+          sudo pkgbuild \
+            --root "${PYTHON_TARGET}" \
+            --identifier "$PKG_ID" \
+            --version "${PYTHON_VERSION}" \
+            --install-location "${PYTHON_TARGET}" \
+            --ownership recommended \
+            --scripts scripts_python \
+            "$PKG_NAME"
+
+          test -s "$PKG_NAME"
+          ls -lh "$PKG_NAME"
 
       # ==========================================
-      # 3. 验证与产物收集
+      # 14. Inspect PKG files
       # ==========================================
-      - name: Verify Installation (在当前虚拟机测试)
+      - name: Inspect generated packages
         run: |
-          PYTHON_BIN="${{ env.PYTHON_TARGET }}/bin/python3"
-          echo "--- Verifying Python Version ---"
-          $PYTHON_BIN --version
-          echo "--- Verifying OpenSSL Link ---"
-          # 此时能够完美打印，因为 RPATH 路径 /usr/local/openssl-3.5.6 此时在虚拟机里是真实存在的！
-          $PYTHON_BIN -c "import ssl; print(f'Python linked to OpenSSL Version: {ssl.OPENSSL_VERSION}')"
+          set -euo pipefail
 
-      - name: Upload Installers
+          OPENSSL_PKG="openssl-${OPENSSL_VERSION}-arm64.pkg"
+          PYTHON_PKG="Python-${PYTHON_VERSION}-arm64.pkg"
+
+          pkgutil --expand "$OPENSSL_PKG" openssl_pkg_check
+          test -f openssl_pkg_check/PackageInfo
+          rm -rf openssl_pkg_check
+
+          pkgutil --expand "$PYTHON_PKG" python_pkg_check
+          test -f python_pkg_check/PackageInfo
+          rm -rf python_pkg_check
+
+          echo "Packages:"
+          ls -lh "$OPENSSL_PKG" "$PYTHON_PKG"
+
+          echo "SHA-256:"
+          shasum -a 256 "$OPENSSL_PKG" "$PYTHON_PKG"
+
+      # ==========================================
+      # 15. Upload artifacts
+      # ==========================================
+      - name: Upload installers
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-Independent-Packages
+          name: Python-${{ env.PYTHON_VERSION }}-OpenSSL-${{ env.OPENSSL_VERSION }}-macOS-arm64
           path: |
-            openssl-${{ env.OPENSSL_VERSION }}.pkg
-            Python-${{ env.PYTHON_VERSION }}.pkg
+            openssl-${{ env.OPENSSL_VERSION }}-arm64.pkg
+            Python-${{ env.PYTHON_VERSION }}-arm64.pkg
+          if-no-files-found: error
+          retention-days: 30
