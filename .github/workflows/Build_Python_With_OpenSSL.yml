@@ -7,8 +7,8 @@ on:
 
 # === 顶层配置区域 (完全隔离的专属路径) ===
 env:
-  PYTHON_VERSION: "3.14.5"   
-  OPENSSL_VERSION: "3.5.6"  
+  PYTHON_VERSION: "3.15.2"   
+  OPENSSL_VERSION: "4.1.0"  
   # 专属安装根目录
   OPENSSL_TARGET: "/usr/local/openssl-${{ env.OPENSSL_VERSION }}"
   PYTHON_TARGET: "/usr/local/Python-${{ env.PYTHON_VERSION }}"
