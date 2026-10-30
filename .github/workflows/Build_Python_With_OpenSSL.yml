@@ -1,0 +1,559 @@
+
+name: Build Python with OpenSSL LTS on macOS ARM64
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# ==========================================
+# Global Version Configuration
+# ==========================================
+env:
+  PYTHON_VERSION: "3.15.2"
+  OPENSSL_VERSION: "3.5.9"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Python and OpenSSL ARM64
+    runs-on: macos-latest
+    timeout-minutes: 180
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      # ==========================================
+      # 1. Checkout
+      # ==========================================
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ==========================================
+      # 2. Initialize environment
+      # ==========================================
+      - name: Initialize environment
+        run: |
+          set -euo pipefail
+
+          ARCH="$(uname -m)"
+
+          echo "Architecture: ${ARCH}"
+          sw_vers
+
+          if [ "${ARCH}" != "arm64" ]; then
+            echo "::error::ARM64 architecture required"
+            exit 1
+          fi
+
+          OPENSSL_TARGET="/usr/local/openssl-${OPENSSL_VERSION}"
+          PYTHON_TARGET="/usr/local/Python-${PYTHON_VERSION}"
+          PYTHON_MINOR="${PYTHON_VERSION%.*}"
+
+          {
+            echo "OPENSSL_TARGET=${OPENSSL_TARGET}"
+            echo "PYTHON_TARGET=${PYTHON_TARGET}"
+            echo "PYTHON_MINOR=${PYTHON_MINOR}"
+          } >> "$GITHUB_ENV"
+
+          echo "OpenSSL: ${OPENSSL_VERSION}"
+          echo "Python: ${PYTHON_VERSION}"
+          echo "OpenSSL target: ${OPENSSL_TARGET}"
+          echo "Python target: ${PYTHON_TARGET}"
+
+          if [ ! -s /etc/ssl/cert.pem ]; then
+            echo "::error::macOS system CA bundle missing"
+            exit 1
+          fi
+
+      # ==========================================
+      # 3. Download OpenSSL LTS
+      # ==========================================
+      - name: Download OpenSSL
+        run: |
+          set -euo pipefail
+
+          URL="https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz"
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 30 \
+            -o openssl.tar.gz \
+            "$URL"
+
+          tar -xzf openssl.tar.gz
+
+          mv "openssl-${OPENSSL_VERSION}" openssl_src
+
+          test -f openssl_src/Configure
+
+      # ==========================================
+      # 4. Build OpenSSL
+      # ==========================================
+      - name: Build and install OpenSSL
+        run: |
+          set -euo pipefail
+
+          cd openssl_src
+
+          ./Configure \
+            darwin64-arm64-cc \
+            shared \
+            --prefix="${OPENSSL_TARGET}" \
+            --openssldir="${OPENSSL_TARGET}/ssl" \
+            --libdir=lib
+
+          make -j "$(sysctl -n hw.ncpu)"
+
+          sudo make install
+
+          OPENSSL_BIN="${OPENSSL_TARGET}/bin/openssl"
+
+          test -x "$OPENSSL_BIN"
+          test -d "${OPENSSL_TARGET}/lib"
+          test -d "${OPENSSL_TARGET}/include/openssl"
+
+          "$OPENSSL_BIN" version -a
+
+      # ==========================================
+      # 5. Configure macOS System CA
+      # ==========================================
+      - name: Configure macOS system CA
+        run: |
+          set -euo pipefail
+
+          SYSTEM_CA="/etc/ssl/cert.pem"
+          OPENSSL_CA="${OPENSSL_TARGET}/ssl/cert.pem"
+
+          test -s "$SYSTEM_CA"
+
+          sudo mkdir -p "${OPENSSL_TARGET}/ssl"
+
+          # Use macOS system CA through a symbolic link
+          sudo ln -sfn "$SYSTEM_CA" "$OPENSSL_CA"
+
+          test -L "$OPENSSL_CA"
+          test -s "$OPENSSL_CA"
+
+          echo "OpenSSL CA symbolic link:"
+          ls -l "$OPENSSL_CA"
+
+          echo "Resolved certificate paths:"
+          realpath "$OPENSSL_CA"
+          realpath "$SYSTEM_CA"
+
+          # Compare actual files rather than raw path strings
+          test "$(realpath "$OPENSSL_CA")" = \
+               "$(realpath "$SYSTEM_CA")"
+
+          echo "macOS system CA configuration passed."
+
+      # ==========================================
+      # 6. Verify OpenSSL TLS
+      # ==========================================
+      - name: Verify OpenSSL TLS
+        run: |
+          set -euo pipefail
+
+          OPENSSL_BIN="${OPENSSL_TARGET}/bin/openssl"
+
+          "$OPENSSL_BIN" version | \
+            grep -F "OpenSSL ${OPENSSL_VERSION}"
+
+          "$OPENSSL_BIN" s_client \
+            -connect www.python.org:443 \
+            -servername www.python.org \
+            -verify_return_error \
+            -brief \
+            </dev/null
+
+          echo "OpenSSL TLS verification passed."
+
+      # ==========================================
+      # 7. Create OpenSSL PKG
+      # ==========================================
+      - name: Create OpenSSL PKG
+        run: |
+          set -euo pipefail
+
+          PKG_ID="org.enmoe.openssl.${OPENSSL_VERSION}"
+          PKG_NAME="openssl-${OPENSSL_VERSION}-arm64.pkg"
+
+          mkdir -p scripts_openssl
+
+          cat > scripts_openssl/postinstall <<EOF
+          #!/bin/sh
+          set -eu
+
+          SYSTEM_CA="/etc/ssl/cert.pem"
+          PRIVATE_CA="${OPENSSL_TARGET}/ssl/cert.pem"
+
+          if [ ! -s "\$SYSTEM_CA" ]; then
+            echo "ERROR: macOS system CA bundle missing" >&2
+            exit 1
+          fi
+
+          mkdir -p "${OPENSSL_TARGET}/ssl"
+          ln -sfn "\$SYSTEM_CA" "\$PRIVATE_CA"
+
+          mkdir -p /etc/paths.d
+          echo "${OPENSSL_TARGET}/bin" > "/etc/paths.d/${PKG_ID}"
+          chmod 644 "/etc/paths.d/${PKG_ID}"
+
+          exit 0
+          EOF
+
+          chmod 755 scripts_openssl/postinstall
+
+          sudo pkgbuild \
+            --root "${OPENSSL_TARGET}" \
+            --identifier "$PKG_ID" \
+            --version "${OPENSSL_VERSION}" \
+            --install-location "${OPENSSL_TARGET}" \
+            --ownership recommended \
+            --scripts scripts_openssl \
+            "$PKG_NAME"
+
+          test -s "$PKG_NAME"
+          ls -lh "$PKG_NAME"
+
+      # ==========================================
+      # 8. Download Python
+      # ==========================================
+      - name: Download Python
+        run: |
+          set -euo pipefail
+
+          URL="https://www.python.org/ftp/python/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz"
+
+          curl -fL \
+            --retry 3 \
+            --connect-timeout 30 \
+            -o python.tgz \
+            "$URL"
+
+          tar -xzf python.tgz
+
+          mv "Python-${PYTHON_VERSION}" python_src
+
+          test -x python_src/configure
+
+      # ==========================================
+      # 9. Build Python
+      # ==========================================
+      - name: Build and install Python
+        run: |
+          set -euo pipefail
+
+          cd python_src
+
+          export CPPFLAGS="-I${OPENSSL_TARGET}/include"
+          export LDFLAGS="-L${OPENSSL_TARGET}/lib"
+          export PKG_CONFIG_PATH="${OPENSSL_TARGET}/lib/pkgconfig${PKG_CONFIG_PATH:+:${PKG_CONFIG_PATH}}"
+
+          ./configure \
+            --prefix="${PYTHON_TARGET}" \
+            --with-openssl="${OPENSSL_TARGET}" \
+            --with-openssl-rpath="${OPENSSL_TARGET}/lib" \
+            --with-ensurepip=install
+
+          make -j "$(sysctl -n hw.ncpu)"
+
+          sudo make altinstall
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python${PYTHON_MINOR}"
+
+          test -x "$PYTHON_BIN"
+
+          cd "${PYTHON_TARGET}/bin"
+
+          sudo ln -sfn "python${PYTHON_MINOR}" python3
+          sudo ln -sfn "python${PYTHON_MINOR}" python
+
+          if [ -x "pip${PYTHON_MINOR}" ]; then
+            sudo ln -sfn "pip${PYTHON_MINOR}" pip3
+            sudo ln -sfn "pip${PYTHON_MINOR}" pip
+          fi
+
+          "${PYTHON_TARGET}/bin/python3" --version
+
+      # ==========================================
+      # 10. Verify Python SSL - FIXED
+      # ==========================================
+      - name: Verify Python SSL
+        run: |
+          set -euo pipefail
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python3"
+
+          "$PYTHON_BIN" - <<'PY'
+          import os
+          import sys
+          import ssl
+          import platform
+
+          print("Python:", sys.version)
+          print("OpenSSL:", ssl.OPENSSL_VERSION)
+          print("Architecture:", platform.machine())
+
+          assert platform.machine() == "arm64", \
+              "Unexpected CPU architecture"
+
+          assert platform.python_version() == \
+              os.environ["PYTHON_VERSION"], \
+              "Python version mismatch"
+
+          assert ssl.OPENSSL_VERSION.startswith(
+              "OpenSSL " + os.environ["OPENSSL_VERSION"]
+          ), "OpenSSL version mismatch"
+
+          assert sys.prefix == os.environ["PYTHON_TARGET"], \
+              "Python installation prefix mismatch"
+
+          # ======================================
+          # Check default CA
+          # ======================================
+          paths = ssl.get_default_verify_paths()
+
+          print("Default CA paths:", paths)
+
+          expected_ca = os.path.join(
+              os.environ["OPENSSL_TARGET"],
+              "ssl",
+              "cert.pem"
+          )
+
+          system_ca = "/etc/ssl/cert.pem"
+
+          assert paths.cafile == expected_ca, \
+              "Incorrect default CA path"
+
+          assert os.path.islink(expected_ca), \
+              "OpenSSL CA is not a symbolic link"
+
+          assert os.path.isfile(system_ca), \
+              "macOS system CA missing"
+
+          # IMPORTANT FIX:
+          # /etc on macOS usually resolves to /private/etc.
+          # Compare file identity instead of literal paths.
+          assert os.path.samefile(
+              expected_ca,
+              system_ca
+          ), "OpenSSL CA does not point to macOS system CA"
+
+          print("OpenSSL CA:", expected_ca)
+          print("macOS CA:", system_ca)
+          print("Resolved CA:", os.path.realpath(expected_ca))
+
+          # ======================================
+          # Verify trusted CA certificates
+          # ======================================
+          context = ssl.create_default_context()
+
+          ca_count = len(context.get_ca_certs())
+
+          print("Loaded CA certificates:", ca_count)
+
+          assert ca_count > 0, \
+              "No trusted CA certificates loaded"
+
+          assert context.verify_mode == ssl.CERT_REQUIRED, \
+              "Certificate verification is not required"
+
+          assert context.check_hostname, \
+              "Hostname verification is disabled"
+
+          print("Python SSL verification passed.")
+          PY
+
+      # ==========================================
+      # 11. Verify Dynamic Libraries
+      # ==========================================
+      - name: Verify OpenSSL dynamic libraries
+        run: |
+          set -euo pipefail
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python3"
+
+          SSL_MODULE="$("$PYTHON_BIN" -c 'import _ssl; print(_ssl.__file__)')"
+
+          echo "Python SSL module:"
+          echo "$SSL_MODULE"
+
+          echo "Dynamic libraries:"
+          otool -L "$SSL_MODULE"
+
+          otool -L "$SSL_MODULE" | \
+            grep -F "${OPENSSL_TARGET}/lib/libssl"
+
+          otool -L "$SSL_MODULE" | \
+            grep -F "${OPENSSL_TARGET}/lib/libcrypto"
+
+          echo "Dynamic library verification passed."
+
+      # ==========================================
+      # 12. Test HTTPS Without CA Configuration
+      # ==========================================
+      - name: Test Python HTTPS
+        run: |
+          set -euo pipefail
+
+          # Remove environment overrides for this test
+          unset SSL_CERT_FILE || true
+          unset SSL_CERT_DIR || true
+          unset REQUESTS_CA_BUNDLE || true
+          unset CURL_CA_BUNDLE || true
+
+          "${PYTHON_TARGET}/bin/python3" - <<'PY'
+          import ssl
+          import urllib.request
+
+          print("OpenSSL:", ssl.OPENSSL_VERSION)
+
+          urls = [
+              "https://www.python.org/",
+              "https://pypi.org/simple/",
+              "https://github.com/",
+          ]
+
+          for url in urls:
+              print("Testing HTTPS:", url, flush=True)
+
+              with urllib.request.urlopen(
+                  url,
+                  timeout=30
+              ) as response:
+                  print("HTTP status:", response.status)
+                  assert 200 <= response.status < 400
+
+          print("All HTTPS tests passed.")
+          PY
+
+      # ==========================================
+      # 13. Test pip
+      # ==========================================
+      - name: Test pip HTTPS
+        run: |
+          set -euo pipefail
+
+          PYTHON_BIN="${PYTHON_TARGET}/bin/python3"
+
+          "$PYTHON_BIN" -m pip --version
+
+          mkdir -p "${RUNNER_TEMP}/pip-test"
+
+          "$PYTHON_BIN" -m pip download \
+            --disable-pip-version-check \
+            --no-deps \
+            --index-url https://pypi.org/simple/ \
+            --dest "${RUNNER_TEMP}/pip-test" \
+            certifi
+
+          test -n "$(ls -A "${RUNNER_TEMP}/pip-test")"
+
+          echo "pip HTTPS verification passed."
+
+      # ==========================================
+      # 14. Create Python PKG
+      # ==========================================
+      - name: Create Python PKG
+        run: |
+          set -euo pipefail
+
+          PKG_ID="org.enmoe.python.${PYTHON_VERSION}"
+          PKG_NAME="Python-${PYTHON_VERSION}-arm64.pkg"
+
+          mkdir -p scripts_python
+
+          cat > scripts_python/postinstall <<EOF
+          #!/bin/sh
+          set -eu
+
+          if [ ! -x "${OPENSSL_TARGET}/bin/openssl" ]; then
+            echo "ERROR: OpenSSL ${OPENSSL_VERSION} required" >&2
+            exit 1
+          fi
+
+          if [ ! -s "${OPENSSL_TARGET}/ssl/cert.pem" ]; then
+            echo "ERROR: OpenSSL CA missing" >&2
+            exit 1
+          fi
+
+          mkdir -p /etc/paths.d
+          echo "${PYTHON_TARGET}/bin" > "/etc/paths.d/${PKG_ID}"
+          chmod 644 "/etc/paths.d/${PKG_ID}"
+
+          exit 0
+          EOF
+
+          chmod 755 scripts_python/postinstall
+
+          sudo pkgbuild \
+            --root "${PYTHON_TARGET}" \
+            --identifier "$PKG_ID" \
+            --version "${PYTHON_VERSION}" \
+            --install-location "${PYTHON_TARGET}" \
+            --ownership recommended \
+            --scripts scripts_python \
+            "$PKG_NAME"
+
+          test -s "$PKG_NAME"
+          ls -lh "$PKG_NAME"
+
+      # ==========================================
+      # 15. Verify Package Integrity
+      # ==========================================
+      - name: Verify packages
+        run: |
+          set -euo pipefail
+
+          OPENSSL_PKG="openssl-${OPENSSL_VERSION}-arm64.pkg"
+          PYTHON_PKG="Python-${PYTHON_VERSION}-arm64.pkg"
+
+          CHECK_DIR="${RUNNER_TEMP}/pkg-check"
+
+          mkdir -p "$CHECK_DIR"
+
+          pkgutil --expand \
+            "$OPENSSL_PKG" \
+            "$CHECK_DIR/openssl"
+
+          pkgutil --expand \
+            "$PYTHON_PKG" \
+            "$CHECK_DIR/python"
+
+          test -f "$CHECK_DIR/openssl/PackageInfo"
+          test -f "$CHECK_DIR/python/PackageInfo"
+
+          test -L "${OPENSSL_TARGET}/ssl/cert.pem"
+
+          test "$(realpath "${OPENSSL_TARGET}/ssl/cert.pem")" = \
+               "$(realpath /etc/ssl/cert.pem)"
+
+          echo "Generated packages:"
+          ls -lh "$OPENSSL_PKG" "$PYTHON_PKG"
+
+          echo "SHA256 checksums:"
+          shasum -a 256 "$OPENSSL_PKG" "$PYTHON_PKG"
+
+          echo "Package verification passed."
+
+      # ==========================================
+      # 16. Upload Packages
+      # ==========================================
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: macOS-ARM64-Python-${{ env.PYTHON_VERSION }}-OpenSSL-${{ env.OPENSSL_VERSION }}
+          path: |
+            openssl-${{ env.OPENSSL_VERSION }}-arm64.pkg
+            Python-${{ env.PYTHON_VERSION }}-arm64.pkg
+          if-no-files-found: error
+          retention-days: 30
